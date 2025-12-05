@@ -24,13 +24,16 @@ MY_RECORDS = []
 CACHE = {}
 CACHE_LOCK = threading.Lock()
 
+
 def log(msg):
     pass
 
+
+
 # utils
 
+# merges unique records from new_rrs into target list and avoids duplicates
 def dedup(target, new_rrs):
-    # merge unique
     for r in new_rrs:
         exists = False
         for t in target:
@@ -40,12 +43,17 @@ def dedup(target, new_rrs):
         if not exists:
             target.append(r)
 
-# cache sys
 
+
+
+
+# cache sys
 class Mem:
+
     def __init__(self):
         self.d = {}
 
+    # based on TTL adds resource records to cache with expiration time 
     def add(self, rrs):
         with CACHE_LOCK:
             now = time.time()
@@ -55,6 +63,8 @@ class Mem:
                 k = (str(r.rname).lower(), r.rtype, str(r.rdata))
                 self.d[k] = (now + r.ttl, r)
 
+
+    # gets cached records for a name and type, adjusting TTL based on remaining time
     def get(self, n, t):
         with CACHE_LOCK:
             now = time.time()
@@ -77,13 +87,20 @@ class Mem:
                 del self.d[k]
             return ret
 
+
 mem = Mem()
+
+
+
 
 # zone ops
 
+# loads and parses the zone file
 def load():
     global MY_ORIGIN, MY_RECORDS
+
     try:
+
         with open(ZONE_FILE, 'r') as f:
             MY_RECORDS = list(RR.fromZone(f.read()))
             for r in MY_RECORDS:
@@ -92,14 +109,21 @@ def load():
     except:
         sys.exit(1)
 
+
+
+# returns glue records for a given nameserver name
 def get_glue(n):
     g = []
     t = str(n).lower()
+
     for r in MY_RECORDS:
         if str(r.rname).lower() == t and r.rtype in [QTYPE.A, QTYPE.AAAA]:
             g.append(r)
     return g
 
+
+
+# looks up records from local zone file and also follows CNAME chains if needed
 def local_look(qn, qt):
     ans = []
     add = []
@@ -124,21 +148,30 @@ def local_look(qn, qt):
 
     return ans, [], add
 
+
+
+
 # net
 
+# checks if child domain is a subdomain of parent domain
 def is_sub(c, p):
     p = str(p).lower().strip('.')
     if not p: return True
     c = str(c).lower().strip('.')
+
     return c == p or c.endswith('.' + p)
 
+
+# transmits DNS query to upstream server with retries and timeout also
 def tx(ip, p):
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(0)
     dst = (ip, UPSTREAM_PORT)
     raw = p.pack()
 
     for _ in range(4):
+
         try:
             s.sendto(raw, dst)
             r, _, _ = select.select([s], [], [], 2.0)
@@ -148,11 +181,17 @@ def tx(ip, p):
                 return DNSRecord.parse(d)
         except:
             pass
+
     s.close()
     return None
 
+
+
+
+
 # resolution
 
+# does recursive DNS resolution starting from root, following referrals and CNAME chains
 def recursive(qn, qt):
     # return (rcode, ans, auth, add)
 
@@ -160,7 +199,7 @@ def recursive(qn, qt):
     hit = mem.get(qn, qt)
     if hit:
         found = any(r.rtype == qt for r in hit)
-
+        
         # glue fetch
         glue_recs = []
         for r in hit:
@@ -174,13 +213,15 @@ def recursive(qn, qt):
     dst = ROOT_IP
     scope = "."
 
+
     out_ans = []
     out_auth = []
     out_add = []
-
     curr = qn
 
+
     for _ in range(15):
+
         req = DNSRecord(q=DNSQuestion(curr, qt))
         res = tx(dst, req)
 
@@ -208,7 +249,8 @@ def recursive(qn, qt):
             cname_rr = next((r for r in out_ans if r.rtype == QTYPE.CNAME and str(r.rname).lower() == str(curr).lower()), None)
             if cname_rr:
                 tgt = str(cname_rr.rdata)
-                # already have it?
+
+                # already have it
                 have_tgt = any(str(r.rname).lower() == tgt.lower() for r in out_ans)
                 if not have_tgt:
                     curr = tgt
@@ -221,6 +263,7 @@ def recursive(qn, qt):
 
             return RCODE.NOERROR, out_ans, out_auth, out_add
 
+
         # referrals
         ns_list = [r for r in ok_auth if r.rtype == QTYPE.NS]
         if ns_list:
@@ -232,7 +275,7 @@ def recursive(qn, qt):
 
             # loop protect
             if res.header.aa:
-                # authoritative but answer in auth section?
+                # authoritative but answer in auth section
                 if qt == QTYPE.NS:
                     return RCODE.NOERROR, [], ok_auth, ok_ar
                 return RCODE.NOERROR, [], ok_auth, ok_ar
@@ -246,6 +289,7 @@ def recursive(qn, qt):
             else:
                 # resolve ns
                 rc, nr, _, _ = recursive(ns_str, QTYPE.A)
+
                 if rc == RCODE.NOERROR and nr and nr[0].rtype == QTYPE.A:
                     new_dst = str(nr[0].rdata)
                     if new_dst == dst: return RCODE.SERVFAIL, [], [], []
@@ -261,10 +305,13 @@ def recursive(qn, qt):
 
     return RCODE.SERVFAIL, [], [], []
 
-# main
 
+
+
+# handels incoming DNS request, serving from local zone or resolving recursively
 def handle(d, a, s):
     try:
+
         q = DNSRecord.parse(d)
         qn = q.q.qname
         qt = q.q.qtype
@@ -289,6 +336,7 @@ def handle(d, a, s):
                 if not exists:
                     rep.header.rcode = RCODE.NXDOMAIN
         else:
+
             rep.header.aa = 0
             if not q.header.rd:
                 rep.header.rcode = RCODE.REFUSED
@@ -298,9 +346,11 @@ def handle(d, a, s):
 
                 # promote ns if needed
                 if qt == QTYPE.NS and not rans and rauth:
+
                     # check if auth has the answer
                     promoted = []
                     rem_auth = []
+                    
                     for r in rauth:
                         if r.rtype == QTYPE.NS and str(r.rname).lower() == str(qn).lower():
                             promoted.append(r)
@@ -318,6 +368,7 @@ def handle(d, a, s):
     except:
         pass
 
+# main server loop that binds to port and creates threads to handle requests
 def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(('127.0.0.1', BIND_PORT))
@@ -332,6 +383,9 @@ def main():
         except:
             pass
 
+
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument('--port', type=int, default=0)
@@ -345,3 +399,8 @@ if __name__ == "__main__":
 
     load()
     main()
+
+
+
+
+
