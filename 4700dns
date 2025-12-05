@@ -4,293 +4,300 @@ import sys
 import socket
 import argparse
 import time
-import struct
-import threading
 import select
-import random
+import threading
+import struct
 from dnslib import *
 
-# config vars
+# settings
 ROOT_IP = "1.2.3.4"
 BIND_PORT = 0
 ZONE_FILE = "example.com.zone"
 UPSTREAM_PORT = 60053
-MY_ZONE_ORIGIN = ""
-MY_ZONE_DATA = []
+TIMEOUT = 5.0
 
-# constants
-RETRY_LIMIT = 5
-RETRY_TIMEOUT = 1.0
+# global data
+MY_ORIGIN = ""
+MY_RECORDS = []
 
-# locking for threads
-CACHE_LOCK = threading.Lock()
+# cache setup
 CACHE = {}
+CACHE_LOCK = threading.Lock()
 
 def log(msg):
-    # sys.stderr.write(msg + "\n")
+    # logging disabled
     pass
+
+# helper structures
 
 class RecordCache:
     def __init__(self):
-        self.store = {}
+        self.data = {}
 
-    def put(self, records):
+    def add(self, records):
         with CACHE_LOCK:
             now = time.time()
             for r in records:
-                # key by name, type, and data (to allow multiple ips)
+                # store record with key
                 key = (str(r.rname).lower(), r.rtype, str(r.rdata))
-                # basic ttl logic
-                expire = now + r.ttl
-                self.store[key] = (expire, r)
+                self.data[key] = (now + r.ttl, r)
 
     def get(self, name, qtype):
         with CACHE_LOCK:
             now = time.time()
             results = []
-            # simplistic scan, could be optimized
-            to_remove = []
+            to_del = []
+            name = str(name).lower()
 
-            # search matching keys
-            for key, val in self.store.items():
-                k_name, k_type, k_data = key
-                expire, rec = val
-
+            for key, (expire, rec) in self.data.items():
+                k_name, k_type, _ = key
                 if now > expire:
-                    to_remove.append(key)
+                    to_del.append(key)
                     continue
 
-                if k_name == str(name).lower():
-                    # match type or if we need a cname
-                    if k_type == qtype or k_type == QTYPE.CNAME:
-                        # update ttl for wire format
-                        left = int(expire - now)
-                        # clone record to set new ttl
-                        new_r = RR(rec.rname, rec.rtype, rec.rclass, left, rec.rdata)
-                        results.append(new_r)
+                if k_name == name:
+                    if k_type == qtype or qtype == QTYPE.ANY or k_type == QTYPE.CNAME:
+                        # adjust ttl
+                        ttl_rem = int(expire - now)
+                        results.append(RR(rec.rname, rec.rtype, rec.rclass, ttl_rem, rec.rdata))
 
-            for k in to_remove:
-                del self.store[k]
-
+            for k in to_del:
+                del self.data[k]
             return results
 
-cache = RecordCache()
+cache_store = RecordCache()
 
-def load_zone():
-    global MY_ZONE_ORIGIN, MY_ZONE_DATA
+# zone file handling
+
+def load_zone(path):
+    global MY_ORIGIN, MY_RECORDS
     try:
-        with open(ZONE_FILE, 'r') as f:
-            raw = f.read()
-            MY_ZONE_DATA = list(RR.fromZone(raw))
-            # find origin from soa
-            for r in MY_ZONE_DATA:
+        with open(path, 'r') as f:
+            MY_RECORDS = list(RR.fromZone(f.read()))
+            for r in MY_RECORDS:
                 if r.rtype == QTYPE.SOA:
-                    MY_ZONE_ORIGIN = str(r.rname).lower()
-    except:
+                    MY_ORIGIN = str(r.rname).lower()
+    except Exception as e:
         sys.exit(1)
 
-def get_local_data(qname, qtype):
-    # search loaded zone
-    ans = []
-    qname = str(qname).lower()
+def get_glue(target_name):
+    # find glue records
+    glues = []
+    target = str(target_name).lower()
+    for r in MY_RECORDS:
+        if str(r.rname).lower() == target and r.rtype in [QTYPE.A, QTYPE.AAAA]:
+            glues.append(r)
+    return glues
 
-    # direct search
-    for r in MY_ZONE_DATA:
-        if str(r.rname).lower() == qname:
-            if r.rtype == qtype:
-                ans.append(r)
-            elif r.rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
-                # found a cname when looking for something else
-                ans.append(r)
-                # chase local cname if possible
-                target = str(r.rdata).lower()
-                ans.extend(get_local_data(target, qtype))
-    return ans
+def get_local_answer(qname, qtype):
+    # check local zone for match
+    answers = []
+    additional = []
+    qname_str = str(qname).lower()
 
-def is_sub(child, parent):
-    # bailiwick helper
+    # 1. direct match check
+    for r in MY_RECORDS:
+        if str(r.rname).lower() == qname_str:
+            if r.rtype == qtype or qtype == QTYPE.ANY:
+                answers.append(r)
+                # include glue if needed
+                if r.rtype in [QTYPE.NS, QTYPE.MX]:
+                    additional.extend(get_glue(r.rdata))
+            elif r.rtype == QTYPE.CNAME:
+                answers.append(r)
+
+    # 2. handle cname chaining if needed
+    if answers and answers[0].rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
+        target = str(answers[0].rdata)
+        sub_ans, sub_auth, sub_add = get_local_answer(target, qtype)
+        answers.extend(sub_ans)
+        additional.extend(sub_add)
+
+    return answers, [], additional
+
+# network helpers
+
+def is_subdomain(child, parent):
     c = str(child).lower().strip('.')
     p = str(parent).lower().strip('.')
     if not p: return True
     return c == p or c.endswith('.' + p)
 
-def send_udp(ip, pkt):
-    # 5700 requirement: retries
+def send_query(ip, pkt):
+    # send with retry logic
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(0)
     dest = (ip, UPSTREAM_PORT)
-    out = pkt.pack()
+    data = pkt.pack()
 
-    for i in range(RETRY_LIMIT + 1):
+    for _ in range(5):
         try:
-            s.sendto(out, dest)
-            ready = select.select([s], [], [], RETRY_TIMEOUT)
+            s.sendto(data, dest)
+            ready = select.select([s], [], [], 1.0)
             if ready[0]:
-                data, _ = s.recvfrom(65535)
+                resp, _ = s.recvfrom(65535)
                 s.close()
-                return DNSRecord.parse(data)
+                return DNSRecord.parse(resp)
         except:
             pass
-
     s.close()
     return None
 
+# core resolution logic
+
 def resolve(qname, qtype):
-    # check cache first
-    cached = cache.get(qname, qtype)
+    # returns sections tuple
+
+    # 1. check cache
+    cached = cache_store.get(qname, qtype)
     if cached:
-        # if we found a cname but wanted A, we might need to resolve the cname target
-        # simple check: if we wanted A and got only CNAME, recurse
         has_type = any(r.rtype == qtype for r in cached)
         if not has_type and qtype != QTYPE.CNAME:
-            # find the cname
-            for r in cached:
-                if r.rtype == QTYPE.CNAME:
-                    target = str(r.rdata)
-                    rest = resolve(target, qtype)
-                    if rest: return cached + rest
-        return cached
+            pass
+        return cached, [], []
 
-    # iterative walk
+    # 2. iterative search
     target_ns = ROOT_IP
-    current_bailiwick = "." # root
+    bailiwick = "."
 
-    # loop prevention
+    final_answers = []
+    final_auth = []
+    final_add = []
+
+    curr_name = qname
+
     for _ in range(15):
-        q = DNSRecord(q=DNSQuestion(qname, qtype))
-        resp = send_udp(target_ns, q)
+        q = DNSRecord(q=DNSQuestion(curr_name, qtype))
+        resp = send_query(target_ns, q)
 
-        if not resp:
-            return None # timeout
+        if not resp: return None
 
-        # filter all incoming records by bailiwick before usage
-        valid_ans = [r for r in resp.rr if is_sub(r.rname, current_bailiwick)]
-        valid_auth = [r for r in resp.auth if is_sub(r.rname, current_bailiwick)]
-        valid_ar = [r for r in resp.ar if is_sub(r.rname, current_bailiwick)]
+        # filter by bailiwick
+        valid_rr = [r for r in resp.rr if is_subdomain(r.rname, bailiwick)]
+        valid_auth = [r for r in resp.auth if is_subdomain(r.rname, bailiwick)]
+        valid_ar = [r for r in resp.ar if is_subdomain(r.rname, bailiwick)]
 
-        # 1. answer found?
-        if valid_ans:
-            cache.put(valid_ans)
-            cache.put(valid_auth) # helpful info
-            cache.put(valid_ar)
+        # update cache
+        cache_store.add(valid_rr + valid_auth + valid_ar)
 
-            # handle cname chain
-            first = valid_ans[0]
+        # check results
+
+        # A. answer found?
+        if valid_rr:
+            final_answers.extend(valid_rr)
+            final_auth.extend(valid_auth)
+            final_add.extend(valid_ar)
+
+            # check cname chain
+            first = valid_rr[0]
             if first.rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
-                target = str(first.rdata)
-                rest = resolve(target, qtype)
-                if rest: return valid_ans + rest
-                return valid_ans
+                cname_target = str(first.rdata)
 
-            return valid_ans
+                have_target = any(str(x.rname).lower() == cname_target.lower() and x.rtype == qtype for x in valid_rr)
 
-        # 2. referral?
-        if valid_auth:
-            # pick an NS
-            ns_list = [r for r in valid_auth if r.rtype == QTYPE.NS]
-            if ns_list:
-                # update bailiwick to the zone cut
-                chosen_ns = ns_list[0]
-                current_bailiwick = str(chosen_ns.rname)
+                if not have_target:
+                    # continue resolving target
+                    curr_name = cname_target
+                    target_ns = ROOT_IP
+                    bailiwick = "."
+                    continue
 
-                # try to find glue
-                ns_name = str(chosen_ns.rdata)
-                glue = [r for r in valid_ar if str(r.rname).lower() == ns_name.lower() and r.rtype == QTYPE.A]
+            return final_answers, final_auth, final_add
 
-                if glue:
-                    target_ns = str(glue[0].rdata)
+        # B. referral found?
+        ns_records = [r for r in valid_auth if r.rtype == QTYPE.NS]
+        if ns_records:
+            ref = ns_records[0]
+            bailiwick = str(ref.rname)
+            ns_name = str(ref.rdata)
+
+            # check glue
+            glue = [r for r in valid_ar if str(r.rname).lower() == ns_name.lower() and r.rtype == QTYPE.A]
+
+            if glue:
+                target_ns = str(glue[0].rdata)
+            else:
+                # resolve ns manually
+                ns_res, _, _ = resolve(ns_name, QTYPE.A)
+                if ns_res and ns_res[0].rtype == QTYPE.A:
+                    target_ns = str(ns_res[0].rdata)
                 else:
-                    # no glue, must resolve NS
-                    ns_res = resolve(ns_name, QTYPE.A)
-                    if ns_res:
-                        # find A record in result
-                        found_ip = None
-                        for r in ns_res:
-                            if r.rtype == QTYPE.A:
-                                found_ip = str(r.rdata)
-                                break
-                        if found_ip:
-                            target_ns = found_ip
-                        else:
-                            return None # failed to find ns ip
-                    else:
-                        return None
-                continue
+                    return None
+            continue
 
-        # 3. nxdomain?
+        # C. nxdomain check
         if resp.header.rcode == RCODE.NXDOMAIN:
-            # return special marker or empty?
-            # returning empty implies no data
-            return []
+            return [], valid_auth, []
 
         return None
 
     return None
 
+# main server loop
+
 def worker(data, addr, sock):
     try:
         req = DNSRecord.parse(data)
-        qn = req.q.qname
-        qt = req.q.qtype
+        qname = req.q.qname
+        qtype = req.q.qtype
 
         reply = req.reply()
 
-        # am i authoritative?
-        if is_sub(qn, MY_ZONE_ORIGIN):
-            # local answer
+        # check authority
+        if is_subdomain(qname, MY_ORIGIN):
             reply.header.aa = 1
-            # check if name exists in zone at all
-            exists = False
-            for r in MY_ZONE_DATA:
-                if str(r.rname).lower() == str(qn).lower():
-                    exists = True
-                    break
+            ans, _, add = get_local_answer(qname, qtype)
 
-            if not exists:
-                reply.header.rcode = RCODE.NXDOMAIN
-            else:
-                ans = get_local_data(qn, qt)
+            if ans:
                 for r in ans: reply.add_answer(r)
-        else:
-            # recursion requested?
-            if req.header.rd:
-                res = resolve(qn, qt)
-                if res is None:
-                    reply.header.rcode = RCODE.SERVFAIL
-                elif len(res) == 0:
-                    reply.header.rcode = RCODE.NXDOMAIN
-                else:
-                    for r in res: reply.add_answer(r)
+                for r in add: reply.add_ar(r)
             else:
-                # no recursion allowed
+                # check existence
+                name_exists = False
+                qstr = str(qname).lower()
+                for r in MY_RECORDS:
+                    if str(r.rname).lower() == qstr:
+                        name_exists = True
+                        break
+
+                if not name_exists:
+                    reply.header.rcode = RCODE.NXDOMAIN
+
+        # recursive mode
+        else:
+            if not req.header.rd:
                 reply.header.rcode = RCODE.REFUSED
+            else:
+                result = resolve(qname, qtype)
+                if result is None:
+                    reply.header.rcode = RCODE.SERVFAIL
+                else:
+                    r_ans, r_auth, r_add = result
+                    if not r_ans and not r_auth:
+                        if len(r_auth) > 0: reply.header.rcode = RCODE.NXDOMAIN
+
+                    # populate response
+                    for r in r_ans: reply.add_answer(r)
+                    for r in r_auth: reply.add_auth(r)
+                    for r in r_add: reply.add_ar(r)
 
         sock.sendto(reply.pack(), addr)
-    except:
+    except Exception as e:
         pass
 
-def start():
-    # setup udp server
+def start_server():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(('127.0.0.1', BIND_PORT))
-
-    # tell simulator we are ready
-    p = s.getsockname()[1]
-    print("Bound to port %d" % p, flush=True)
+    print("Bound to port %d" % s.getsockname()[1], flush=True)
 
     while True:
         try:
-            r, _, _ = select.select([s], [], [], 1.0)
-            if r:
-                d, a = s.recvfrom(65535)
-                # thread for concurrency
-                t = threading.Thread(target=worker, args=(d, a, s))
-                t.daemon = True
-                t.start()
-        except KeyboardInterrupt:
-            break
+            readable, _, _ = select.select([s], [], [], 1.0)
+            if readable:
+                data, addr = s.recvfrom(65535)
+                threading.Thread(target=worker, args=(data, addr, s)).start()
         except:
-            continue
+            pass
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -303,5 +310,5 @@ if __name__ == "__main__":
     ZONE_FILE = args.zone
     BIND_PORT = args.port
 
-    load_zone()
-    start()
+    load_zone(ZONE_FILE)
+    start_server()
