@@ -30,7 +30,7 @@ def log(msg):
 # utils
 
 def dedup(target_list, new_records):
-    # avoid duplicates
+    # uniq
     for r in new_records:
         found = False
         for existing in target_list:
@@ -157,7 +157,7 @@ def recursive(qn, qt):
     # try cache
     hit = mem.get(qn, qt)
     if hit:
-        # check if we need to chase cname
+        # verify type match
         found = any(r.rtype == qt for r in hit)
 
         # cache glue lookup
@@ -185,26 +185,31 @@ def recursive(qn, qt):
 
         if not res: return None
 
-        # validate
+        # validate scope
         ok_rr = [r for r in res.rr if is_sub(r.rname, scope)]
         ok_auth = [r for r in res.auth if is_sub(r.rname, scope)]
         ok_ar = [r for r in res.ar if is_sub(r.rname, scope)]
 
         mem.add(ok_rr + ok_auth + ok_ar)
 
+        # stop if authoritative
+        if res.header.aa:
+            if ok_rr: dedup(out_ans, ok_rr)
+            # return context as well
+            return out_ans if out_ans else ok_rr, ok_auth, ok_ar
+
         if ok_rr:
             # merge
             dedup(out_ans, ok_rr)
-            # update context
             out_auth = ok_auth
             out_add = ok_ar
 
-            # check type match
+            # check type
             got_type = any(r.rtype == qt for r in out_ans if str(r.rname).lower() == str(curr).lower())
             if got_type or qt == QTYPE.CNAME:
                 return out_ans, out_auth, out_add
 
-            # cname handling
+            # cname loop
             cname_rr = next((r for r in out_ans if r.rtype == QTYPE.CNAME and str(r.rname).lower() == str(curr).lower()), None)
             if cname_rr:
                 tgt = str(cname_rr.rdata)
@@ -242,7 +247,7 @@ def recursive(qn, qt):
         if res.header.rcode == RCODE.NXDOMAIN:
             return [], ok_auth, []
 
-        # fallback empty
+        # no info
         return [], [], []
 
     return None
