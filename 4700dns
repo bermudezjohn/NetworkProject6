@@ -9,26 +9,26 @@ import threading
 import struct
 from dnslib import *
 
-# settings
+# config
 ROOT_IP = "1.2.3.4"
 BIND_PORT = 0
 ZONE_FILE = "example.com.zone"
 UPSTREAM_PORT = 60053
 TIMEOUT = 5.0
 
-# global data
+# zone data
 MY_ORIGIN = ""
 MY_RECORDS = []
 
-# cache setup
+# storage
 CACHE = {}
 CACHE_LOCK = threading.Lock()
 
 def log(msg):
-    # logging disabled
+    # no logs
     pass
 
-# helper structures
+# storage class
 
 class RecordCache:
     def __init__(self):
@@ -38,7 +38,7 @@ class RecordCache:
         with CACHE_LOCK:
             now = time.time()
             for r in records:
-                # store record with key
+                # store unique key
                 key = (str(r.rname).lower(), r.rtype, str(r.rdata))
                 self.data[key] = (now + r.ttl, r)
 
@@ -55,10 +55,11 @@ class RecordCache:
                     to_del.append(key)
                     continue
 
+                # match logic
                 if k_name == name:
                     if k_type == qtype or qtype == QTYPE.ANY or k_type == QTYPE.CNAME:
-                        # adjust ttl
                         ttl_rem = int(expire - now)
+                        # copy record
                         results.append(RR(rec.rname, rec.rtype, rec.rclass, ttl_rem, rec.rdata))
 
             for k in to_del:
@@ -67,7 +68,7 @@ class RecordCache:
 
 cache_store = RecordCache()
 
-# zone file handling
+# loader
 
 def load_zone(path):
     global MY_ORIGIN, MY_RECORDS
@@ -81,7 +82,7 @@ def load_zone(path):
         sys.exit(1)
 
 def get_glue(target_name):
-    # find glue records
+    # helper for glue
     glues = []
     target = str(target_name).lower()
     for r in MY_RECORDS:
@@ -90,23 +91,23 @@ def get_glue(target_name):
     return glues
 
 def get_local_answer(qname, qtype):
-    # check local zone for match
+    # find local matches
     answers = []
     additional = []
     qname_str = str(qname).lower()
 
-    # 1. direct match check
+    # 1. search records
     for r in MY_RECORDS:
         if str(r.rname).lower() == qname_str:
             if r.rtype == qtype or qtype == QTYPE.ANY:
                 answers.append(r)
-                # include glue if needed
+                # check glue
                 if r.rtype in [QTYPE.NS, QTYPE.MX]:
                     additional.extend(get_glue(r.rdata))
             elif r.rtype == QTYPE.CNAME:
                 answers.append(r)
 
-    # 2. handle cname chaining if needed
+    # 2. cname expansion
     if answers and answers[0].rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
         target = str(answers[0].rdata)
         sub_ans, sub_auth, sub_add = get_local_answer(target, qtype)
@@ -115,7 +116,7 @@ def get_local_answer(qname, qtype):
 
     return answers, [], additional
 
-# network helpers
+# checks
 
 def is_subdomain(child, parent):
     c = str(child).lower().strip('.')
@@ -124,7 +125,7 @@ def is_subdomain(child, parent):
     return c == p or c.endswith('.' + p)
 
 def send_query(ip, pkt):
-    # send with retry logic
+    # network op
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setblocking(0)
     dest = (ip, UPSTREAM_PORT)
@@ -143,97 +144,111 @@ def send_query(ip, pkt):
     s.close()
     return None
 
-# core resolution logic
+# resolution
 
 def resolve(qname, qtype):
-    # returns sections tuple
+    # main logic
 
-    # 1. check cache
+    # 1. cache check
     cached = cache_store.get(qname, qtype)
     if cached:
+        # check if incomplete cname
         has_type = any(r.rtype == qtype for r in cached)
         if not has_type and qtype != QTYPE.CNAME:
             pass
-        return cached, [], []
+        else:
+            return cached, [], []
 
-    # 2. iterative search
+    # 2. recursion
     target_ns = ROOT_IP
     bailiwick = "."
 
-    final_answers = []
+    final_ans = []
     final_auth = []
     final_add = []
 
     curr_name = qname
 
-    for _ in range(15):
-        q = DNSRecord(q=DNSQuestion(curr_name, qtype))
-        resp = send_query(target_ns, q)
+    # protection loop
+    for _ in range(10):
+        # per-name loop
+        found_step_answer = False
 
-        if not resp: return None
+        for _ in range(15):
+            q = DNSRecord(q=DNSQuestion(curr_name, qtype))
+            resp = send_query(target_ns, q)
 
-        # filter by bailiwick
-        valid_rr = [r for r in resp.rr if is_subdomain(r.rname, bailiwick)]
-        valid_auth = [r for r in resp.auth if is_subdomain(r.rname, bailiwick)]
-        valid_ar = [r for r in resp.ar if is_subdomain(r.rname, bailiwick)]
+            if not resp: return None
 
-        # update cache
-        cache_store.add(valid_rr + valid_auth + valid_ar)
+            # filtering
+            valid_rr = [r for r in resp.rr if is_subdomain(r.rname, bailiwick)]
+            valid_auth = [r for r in resp.auth if is_subdomain(r.rname, bailiwick)]
+            valid_ar = [r for r in resp.ar if is_subdomain(r.rname, bailiwick)]
 
-        # check results
+            cache_store.add(valid_rr + valid_auth + valid_ar)
 
-        # A. answer found?
-        if valid_rr:
-            final_answers.extend(valid_rr)
-            final_auth.extend(valid_auth)
-            final_add.extend(valid_ar)
+            # case A: answer
+            if valid_rr:
+                final_ans.extend(valid_rr)
+                # save context
+                final_auth = valid_auth
+                final_add = valid_ar
+                found_step_answer = True
+                break
 
-            # check cname chain
-            first = valid_rr[0]
-            if first.rtype == QTYPE.CNAME and qtype != QTYPE.CNAME:
-                cname_target = str(first.rdata)
+            # case B: referral
+            ns_records = [r for r in valid_auth if r.rtype == QTYPE.NS]
+            if ns_records:
+                ref = ns_records[0]
+                bailiwick = str(ref.rname)
+                ns_name = str(ref.rdata)
 
-                have_target = any(str(x.rname).lower() == cname_target.lower() and x.rtype == qtype for x in valid_rr)
+                # glue check
+                glue = [r for r in valid_ar if str(r.rname).lower() == ns_name.lower() and r.rtype == QTYPE.A]
 
-                if not have_target:
-                    # continue resolving target
-                    curr_name = cname_target
-                    target_ns = ROOT_IP
-                    bailiwick = "."
-                    continue
-
-            return final_answers, final_auth, final_add
-
-        # B. referral found?
-        ns_records = [r for r in valid_auth if r.rtype == QTYPE.NS]
-        if ns_records:
-            ref = ns_records[0]
-            bailiwick = str(ref.rname)
-            ns_name = str(ref.rdata)
-
-            # check glue
-            glue = [r for r in valid_ar if str(r.rname).lower() == ns_name.lower() and r.rtype == QTYPE.A]
-
-            if glue:
-                target_ns = str(glue[0].rdata)
-            else:
-                # resolve ns manually
-                ns_res, _, _ = resolve(ns_name, QTYPE.A)
-                if ns_res and ns_res[0].rtype == QTYPE.A:
-                    target_ns = str(ns_res[0].rdata)
+                if glue:
+                    target_ns = str(glue[0].rdata)
                 else:
-                    return None
-            continue
+                    # sub-query
+                    ns_res, _, _ = resolve(ns_name, QTYPE.A)
+                    if ns_res and ns_res[0].rtype == QTYPE.A:
+                        target_ns = str(ns_res[0].rdata)
+                    else:
+                        return None
+                continue
 
-        # C. nxdomain check
-        if resp.header.rcode == RCODE.NXDOMAIN:
-            return [], valid_auth, []
+            # case C: error
+            if resp.header.rcode == RCODE.NXDOMAIN:
+                return [], valid_auth, []
 
-        return None
+            return None # unexpected
+
+        if not found_step_answer:
+            return None
+
+        # handle chaining
+        # check if we have the final type
+        has_final = any(r.rtype == qtype for r in final_ans if str(r.rname).lower() == str(qname).lower())
+        if has_final or qtype == QTYPE.CNAME:
+            return final_ans, final_auth, final_add
+
+        # check if we have a cname to chase
+        last_rr = final_ans[-1]
+        if last_rr.rtype == QTYPE.CNAME:
+            target = str(last_rr.rdata)
+            # check if already in packet
+            already_here = any(str(r.rname).lower() == target.lower() for r in final_ans)
+            if not already_here:
+                curr_name = target
+                target_ns = ROOT_IP
+                bailiwick = "."
+                continue
+
+        return final_ans, final_auth, final_add
 
     return None
 
-# main server loop
+# server routine
 
 def worker(data, addr, sock):
     try:
@@ -243,7 +258,7 @@ def worker(data, addr, sock):
 
         reply = req.reply()
 
-        # check authority
+        # local vs recursive
         if is_subdomain(qname, MY_ORIGIN):
             reply.header.aa = 1
             ans, _, add = get_local_answer(qname, qtype)
@@ -263,7 +278,6 @@ def worker(data, addr, sock):
                 if not name_exists:
                     reply.header.rcode = RCODE.NXDOMAIN
 
-        # recursive mode
         else:
             if not req.header.rd:
                 reply.header.rcode = RCODE.REFUSED
@@ -274,9 +288,10 @@ def worker(data, addr, sock):
                 else:
                     r_ans, r_auth, r_add = result
                     if not r_ans and not r_auth:
+                        # pass through error state
                         if len(r_auth) > 0: reply.header.rcode = RCODE.NXDOMAIN
 
-                    # populate response
+                    # build packet
                     for r in r_ans: reply.add_answer(r)
                     for r in r_auth: reply.add_auth(r)
                     for r in r_add: reply.add_ar(r)
