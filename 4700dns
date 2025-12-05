@@ -9,25 +9,25 @@ import threading
 import struct
 from dnslib import *
 
-# setup
+# settings
 ROOT_IP = "1.2.3.4"
 BIND_PORT = 0
 ZONE_FILE = "example.com.zone"
 UPSTREAM_PORT = 60053
 TIMEOUT = 5.0
 
-# data
+# zone data
 MY_ORIGIN = ""
 MY_RECORDS = []
 
-# memory
+# cache
 CACHE = {}
 CACHE_LOCK = threading.Lock()
 
 def log(msg):
     pass
 
-# cache sys
+# cache class
 
 class Mem:
     def __init__(self):
@@ -37,7 +37,8 @@ class Mem:
         with CACHE_LOCK:
             now = time.time()
             for r in rrs:
-                # key by name/type/data
+                if not r.rdata: continue
+                # unique key
                 k = (str(r.rname).lower(), r.rtype, str(r.rdata))
                 self.d[k] = (now + r.ttl, r)
 
@@ -57,6 +58,7 @@ class Mem:
                 if kn == n:
                     if kt == t or t == QTYPE.ANY or kt == QTYPE.CNAME:
                         left = int(exp - now)
+                        # safe copy
                         ret.append(RR(rec.rname, rec.rtype, rec.rclass, left, rec.rdata))
 
             for k in kill:
@@ -65,7 +67,7 @@ class Mem:
 
 mem = Mem()
 
-# zone ops
+# zone utils
 
 def load():
     global MY_ORIGIN, MY_RECORDS
@@ -91,7 +93,7 @@ def local_look(qn, qt):
     add = []
     qs = str(qn).lower()
 
-    # scan zone
+    # search records
     for r in MY_RECORDS:
         if str(r.rname).lower() == qs:
             if r.rtype == qt or qt == QTYPE.ANY:
@@ -101,7 +103,7 @@ def local_look(qn, qt):
             elif r.rtype == QTYPE.CNAME:
                 ans.append(r)
 
-    # recurse for cname
+    # cname chase
     if ans and ans[0].rtype == QTYPE.CNAME and qt != QTYPE.CNAME:
         tgt = str(ans[0].rdata)
         sa, _, sa_add = local_look(tgt, qt)
@@ -110,12 +112,13 @@ def local_look(qn, qt):
 
     return ans, [], add
 
-# net utils
+# networking
 
 def is_sub(c, p):
-    if not p: return False
-    c = str(c).lower().rstrip('.')
-    p = str(p).lower().rstrip('.')
+    # root check
+    p = str(p).lower().strip('.')
+    if not p: return True
+    c = str(c).lower().strip('.')
     return c == p or c.endswith('.' + p)
 
 def tx(ip, p):
@@ -124,10 +127,10 @@ def tx(ip, p):
     dst = (ip, UPSTREAM_PORT)
     raw = p.pack()
 
-    for _ in range(5):
+    for _ in range(3):
         try:
             s.sendto(raw, dst)
-            r, _, _ = select.select([s], [], [], 1.0)
+            r, _, _ = select.select([s], [], [], 1.5)
             if r:
                 d, _ = s.recvfrom(65535)
                 s.close()
@@ -137,17 +140,15 @@ def tx(ip, p):
     s.close()
     return None
 
-# resolution
+# main logic
 
 def recursive(qn, qt):
-    # try cache
+    # cache first
     hit = mem.get(qn, qt)
     if hit:
-        # verify completeness
         found = any(r.rtype == qt for r in hit)
         if found or qt == QTYPE.CNAME:
             return hit, [], []
-        # if cname chain, we might continue, but basic cache ok
 
     dst = ROOT_IP
     scope = "."
@@ -158,37 +159,37 @@ def recursive(qn, qt):
 
     curr = qn
 
-    for _ in range(12):
+    for _ in range(20):
         req = DNSRecord(q=DNSQuestion(curr, qt))
         res = tx(dst, req)
 
         if not res: return None
 
-        # filter
+        # filters
         ok_rr = [r for r in res.rr if is_sub(r.rname, scope)]
         ok_auth = [r for r in res.auth if is_sub(r.rname, scope)]
         ok_ar = [r for r in res.ar if is_sub(r.rname, scope)]
 
         mem.add(ok_rr + ok_auth + ok_ar)
 
+        # update authorities
+        out_auth = ok_auth
+        out_add = ok_ar
+
+        # found answer?
         if ok_rr:
-            # new answers
             for r in ok_rr:
                 if r not in out_ans: out_ans.append(r)
-            out_auth = ok_auth
-            out_add = ok_ar
 
-            # check if we need to chase cname
-            # see if we have the type we want
+            # check completeness
             got_type = any(r.rtype == qt for r in out_ans if str(r.rname).lower() == str(curr).lower())
             if got_type or qt == QTYPE.CNAME:
                 return out_ans, out_auth, out_add
 
-            # check for cname link
+            # cname loop
             cname_rr = next((r for r in out_ans if r.rtype == QTYPE.CNAME and str(r.rname).lower() == str(curr).lower()), None)
             if cname_rr:
                 tgt = str(cname_rr.rdata)
-                # do we already have the target?
                 have_tgt = any(str(r.rname).lower() == tgt.lower() for r in out_ans)
                 if not have_tgt:
                     curr = tgt
@@ -196,14 +197,12 @@ def recursive(qn, qt):
                     scope = "."
                     continue
                 else:
-                    # check if target resolved to A
                     curr = tgt
-                    # loop to check if the new curr matches
                     continue
 
             return out_ans, out_auth, out_add
 
-        # referrals
+        # referral
         ns_list = [r for r in ok_auth if r.rtype == QTYPE.NS]
         if ns_list:
             ref = ns_list[0]
@@ -215,7 +214,6 @@ def recursive(qn, qt):
             if glue:
                 dst = str(glue[0].rdata)
             else:
-                # manual resolve
                 nr, _, _ = recursive(ns_str, QTYPE.A)
                 if nr and nr[0].rtype == QTYPE.A:
                     dst = str(nr[0].rdata)
@@ -223,10 +221,13 @@ def recursive(qn, qt):
                     return None
             continue
 
+        # bailiwick empty case or nxdomain
         if res.header.rcode == RCODE.NXDOMAIN:
             return [], ok_auth, []
 
-        return None
+        # no answer, no referral, no error = probably empty due to bailiwick
+        # return what we have (empty) to avoid servfail
+        return [], [], []
 
     return None
 
@@ -248,7 +249,6 @@ def handle(d, a, s):
                 for x in ra: rep.add_answer(x)
                 for x in rad: rep.add_ar(x)
             else:
-                # exists check
                 exists = False
                 qs = str(qn).lower()
                 for r in MY_RECORDS:
@@ -258,7 +258,7 @@ def handle(d, a, s):
                 if not exists:
                     rep.header.rcode = RCODE.NXDOMAIN
         else:
-            rep.header.aa = 0 # recursive
+            rep.header.aa = 0
             if not q.header.rd:
                 rep.header.rcode = RCODE.REFUSED
             else:
