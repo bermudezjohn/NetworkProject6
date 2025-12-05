@@ -9,7 +9,7 @@ import threading
 import struct
 from dnslib import *
 
-# setup
+# config
 ROOT_IP = "1.2.3.4"
 BIND_PORT = 0
 ZONE_FILE = "example.com.zone"
@@ -20,7 +20,7 @@ TIMEOUT = 5.0
 MY_ORIGIN = ""
 MY_RECORDS = []
 
-# memory
+# cache
 CACHE = {}
 CACHE_LOCK = threading.Lock()
 
@@ -29,18 +29,18 @@ def log(msg):
 
 # utils
 
-def dedup(target_list, new_records):
-    # uniq
-    for r in new_records:
-        found = False
-        for existing in target_list:
-            if str(r) == str(existing):
-                found = True
+def dedup(target, new_rrs):
+    # merge unique
+    for r in new_rrs:
+        exists = False
+        for t in target:
+            if r.rname == t.rname and r.rtype == t.rtype and r.rdata == t.rdata:
+                exists = True
                 break
-        if not found:
-            target_list.append(r)
+        if not exists:
+            target.append(r)
 
-# cache
+# cache sys
 
 class Mem:
     def __init__(self):
@@ -79,7 +79,7 @@ class Mem:
 
 mem = Mem()
 
-# zone
+# zone ops
 
 def load():
     global MY_ORIGIN, MY_RECORDS
@@ -115,7 +115,7 @@ def local_look(qn, qt):
             elif r.rtype == QTYPE.CNAME:
                 ans.append(r)
 
-    # cname check
+    # recurse cname
     if ans and ans[0].rtype == QTYPE.CNAME and qt != QTYPE.CNAME:
         tgt = str(ans[0].rdata)
         sa, _, sa_add = local_look(tgt, qt)
@@ -151,16 +151,17 @@ def tx(ip, p):
     s.close()
     return None
 
-# resolver
+# resolution
 
 def recursive(qn, qt):
-    # try cache
+    # return (rcode, ans, auth, add)
+
+    # cache check
     hit = mem.get(qn, qt)
     if hit:
-        # verify type match
         found = any(r.rtype == qt for r in hit)
 
-        # cache glue lookup
+        # glue fetch
         glue_recs = []
         for r in hit:
             if r.rtype in [QTYPE.NS, QTYPE.MX]:
@@ -168,7 +169,7 @@ def recursive(qn, qt):
                 if g: glue_recs.extend(g)
 
         if found or qt == QTYPE.CNAME:
-            return hit, [], glue_recs
+            return RCODE.NOERROR, hit, [], glue_recs
 
     dst = ROOT_IP
     scope = "."
@@ -183,36 +184,31 @@ def recursive(qn, qt):
         req = DNSRecord(q=DNSQuestion(curr, qt))
         res = tx(dst, req)
 
-        if not res: return None
+        if not res: return RCODE.SERVFAIL, [], [], []
 
-        # validate scope
+        # filters
         ok_rr = [r for r in res.rr if is_sub(r.rname, scope)]
         ok_auth = [r for r in res.auth if is_sub(r.rname, scope)]
         ok_ar = [r for r in res.ar if is_sub(r.rname, scope)]
 
         mem.add(ok_rr + ok_auth + ok_ar)
 
-        # stop if authoritative
-        if res.header.aa:
-            if ok_rr: dedup(out_ans, ok_rr)
-            # return context as well
-            return out_ans if out_ans else ok_rr, ok_auth, ok_ar
-
+        # found answer
         if ok_rr:
-            # merge
             dedup(out_ans, ok_rr)
             out_auth = ok_auth
             out_add = ok_ar
 
-            # check type
+            # types
             got_type = any(r.rtype == qt for r in out_ans if str(r.rname).lower() == str(curr).lower())
             if got_type or qt == QTYPE.CNAME:
-                return out_ans, out_auth, out_add
+                return RCODE.NOERROR, out_ans, out_auth, out_add
 
-            # cname loop
+            # cname chain
             cname_rr = next((r for r in out_ans if r.rtype == QTYPE.CNAME and str(r.rname).lower() == str(curr).lower()), None)
             if cname_rr:
                 tgt = str(cname_rr.rdata)
+                # already have it?
                 have_tgt = any(str(r.rname).lower() == tgt.lower() for r in out_ans)
                 if not have_tgt:
                     curr = tgt
@@ -223,7 +219,7 @@ def recursive(qn, qt):
                     curr = tgt
                     continue
 
-            return out_ans, out_auth, out_add
+            return RCODE.NOERROR, out_ans, out_auth, out_add
 
         # referrals
         ns_list = [r for r in ok_auth if r.rtype == QTYPE.NS]
@@ -234,25 +230,38 @@ def recursive(qn, qt):
 
             glue = [r for r in ok_ar if str(r.rname).lower() == ns_str.lower() and r.rtype == QTYPE.A]
 
+            # loop protect
+            if res.header.aa:
+                # authoritative but answer in auth section?
+                if qt == QTYPE.NS:
+                    return RCODE.NOERROR, [], ok_auth, ok_ar
+                return RCODE.NOERROR, [], ok_auth, ok_ar
+
             if glue:
-                dst = str(glue[0].rdata)
+                new_dst = str(glue[0].rdata)
+                if new_dst == dst:
+                    # loop detected
+                    return RCODE.SERVFAIL, [], [], []
+                dst = new_dst
             else:
-                nr, _, _ = recursive(ns_str, QTYPE.A)
-                if nr and nr[0].rtype == QTYPE.A:
-                    dst = str(nr[0].rdata)
+                # resolve ns
+                rc, nr, _, _ = recursive(ns_str, QTYPE.A)
+                if rc == RCODE.NOERROR and nr and nr[0].rtype == QTYPE.A:
+                    new_dst = str(nr[0].rdata)
+                    if new_dst == dst: return RCODE.SERVFAIL, [], [], []
+                    dst = new_dst
                 else:
-                    return None
+                    return RCODE.SERVFAIL, [], [], []
             continue
 
         if res.header.rcode == RCODE.NXDOMAIN:
-            return [], ok_auth, []
+            return RCODE.NXDOMAIN, [], ok_auth, []
 
-        # no info
-        return [], [], []
+        return RCODE.NOERROR, [], [], []
 
-    return None
+    return RCODE.SERVFAIL, [], [], []
 
-# handler
+# main
 
 def handle(d, a, s):
     try:
@@ -270,6 +279,7 @@ def handle(d, a, s):
                 for x in ra: rep.add_answer(x)
                 for x in rad: rep.add_ar(x)
             else:
+                # exist check
                 exists = False
                 qs = str(qn).lower()
                 for r in MY_RECORDS:
@@ -283,17 +293,26 @@ def handle(d, a, s):
             if not q.header.rd:
                 rep.header.rcode = RCODE.REFUSED
             else:
-                ret = recursive(qn, qt)
-                if ret is None:
-                    rep.header.rcode = RCODE.SERVFAIL
-                else:
-                    rans, rauth, radd = ret
-                    if not rans and not rauth:
-                        if len(rauth) > 0: rep.header.rcode = RCODE.NXDOMAIN
+                rc, rans, rauth, radd = recursive(qn, qt)
+                rep.header.rcode = rc
 
-                    for x in rans: rep.add_answer(x)
-                    for x in rauth: rep.add_auth(x)
-                    for x in radd: rep.add_ar(x)
+                # promote ns if needed
+                if qt == QTYPE.NS and not rans and rauth:
+                    # check if auth has the answer
+                    promoted = []
+                    rem_auth = []
+                    for r in rauth:
+                        if r.rtype == QTYPE.NS and str(r.rname).lower() == str(qn).lower():
+                            promoted.append(r)
+                        else:
+                            rem_auth.append(r)
+                    if promoted:
+                        rans = promoted
+                        rauth = rem_auth
+
+                for x in rans: rep.add_answer(x)
+                for x in rauth: rep.add_auth(x)
+                for x in radd: rep.add_ar(x)
 
         s.sendto(rep.pack(), a)
     except:
